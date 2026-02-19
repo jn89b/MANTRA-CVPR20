@@ -7,12 +7,28 @@ import random
 
 class model_controllerMem(nn.Module):
     """
-    Memory Network model with learnable writing controller.
+    Writing Controller (MANTRA) — trajectory-only
+
+    Same structure as original:
+      - conv_past/conv_fut
+      - encoder_past/encoder_fut
+      - cosine similarity memory read
+      - decoder autoregressive rollout
+      - FC_output predicts displacement
+      - coords_next = present + displacement
+
+    Updated for 3D trajectories (x,y,z).
+    Expects:
+      past:   (B, Tp, 3)
+      future: (B, Tf, 3) (optional)
+    Produces:
+      prediction: (B, num_prediction, Tf, 3) when future is None
+      or (writing_prob, tolerance_rate) when future is provided (training)
     """
 
     def __init__(self, settings, model_pretrained):
         super(model_controllerMem, self).__init__()
-        self.name_model = 'writing_controller'
+        self.name_model = "writing_controller"
 
         # parameters
         self.use_cuda = settings["use_cuda"]
@@ -21,17 +37,20 @@ class model_controllerMem(nn.Module):
         self.past_len = settings["past_len"]
         self.future_len = settings["future_len"]
 
+        # coordinate dimension (3D)
+        self.coord_dim = 3
+
         # similarity criterion
         self.weight_read = []
         self.index_max = []
         self.similarity = nn.CosineSimilarity(dim=1)
 
         # Memory
-        self.memory_past = torch.Tensor().cuda()
-        self.memory_fut = torch.Tensor().cuda()
+        self.memory_past = torch.empty(0)
+        self.memory_fut = torch.empty(0)
         self.memory_count = []
 
-        # layers
+        # layers (re-use pretrained components)
         self.conv_past = model_pretrained.conv_past
         self.conv_fut = model_pretrained.conv_fut
 
@@ -42,169 +61,189 @@ class model_controllerMem(nn.Module):
 
         # activation functions
         self.relu = nn.ReLU()
-        self.softmax = nn.Softmax()
+        self.softmax = nn.Softmax(dim=1)
 
         self.linear_controller = torch.nn.Linear(1, 1)
 
+        if self.use_cuda:
+            self.cuda()
+
+    def _device(self):
+        return next(self.parameters()).device
+
     def init_memory(self, data_train):
         """
-        Initialization: write samples in memory.
-        :param data_train: dataset
-        :return: None
+        Initialization: write random samples in memory.
+        Expects dataset __getitem__ to return:
+          [.., past, future, ..]
+        consistent with original MANTRA dataset indexing.
         """
 
-        self.memory_past = torch.Tensor().cuda()
-        self.memory_fut = torch.Tensor().cuda()
-        for i in range(self.num_prediction + 1):
+        device = self._device()
+        self.memory_past = torch.empty(0, self.dim_embedding_key, device=device)
+        self.memory_fut = torch.empty(0, self.dim_embedding_key, device=device)
 
-            # random element from train dataset to be added in memory
-            j = random.randint(0, len(data_train)-1)
-            past = data_train[j][1].unsqueeze(0)
-            future = data_train[j][2].unsqueeze(0)
-            past = past.cuda()
-            future = future.cuda()
+        for _ in range(self.num_prediction + 1):
+            j = random.randint(0, len(data_train) - 1)
+            past = data_train[j][1].unsqueeze(0).to(device)    # (1,Tp,3)
+            future = data_train[j][2].unsqueeze(0).to(device)  # (1,Tf,3)
 
             # past encoding
-            past = torch.transpose(past, 1, 2)
-            story_embed = self.relu(self.conv_past(past))
-            story_embed = torch.transpose(story_embed, 1, 2)
-            output_past, state_past = self.encoder_past(story_embed)
+            past_t = torch.transpose(past, 1, 2)                 # (1,3,Tp)
+            story_embed = self.relu(self.conv_past(past_t))      # (1,C',Tp) depends on conv
+            story_embed = torch.transpose(story_embed, 1, 2)     # (1,Tp,C')
+            _, state_past = self.encoder_past(story_embed)       # state_past: (1,1,K) or (L,1,K)
 
             # future encoding
-            future = torch.transpose(future, 1, 2)
-            future_embed = self.relu(self.conv_fut(future))
+            fut_t = torch.transpose(future, 1, 2)
+            future_embed = self.relu(self.conv_fut(fut_t))
             future_embed = torch.transpose(future_embed, 1, 2)
-            output_fut, state_fut = self.encoder_fut(future_embed)
+            _, state_fut = self.encoder_fut(future_embed)
 
             # insert in memory
+            # state_* expected shape (1,1,K) in original code after squeeze(0) -> (1,K)
             self.memory_past = torch.cat((self.memory_past, state_past.squeeze(0)), 0)
             self.memory_fut = torch.cat((self.memory_fut, state_fut.squeeze(0)), 0)
 
     def check_memory(self, index):
         """
-        Method to generate a future track from past-future feature read from an index location of the memory.
-        :param index: index of the memory
-        :return: predicted future
+        Generate a future track from a stored memory index.
         """
+        device = self._device()
 
-        mem_past_i = self.memory_past[index]
-        mem_fut_i = self.memory_fut[index]
-        zero_padding = torch.zeros(1, 1, 96).cuda()
-        present = torch.zeros(1, 2).cuda()
-        prediction_single = torch.Tensor().cuda()
-        info_total = torch.cat((mem_past_i, mem_fut_i), 0)
-        input_dec = info_total.unsqueeze(0).unsqueeze(0)
-        state_dec = zero_padding
-        for i in range(self.future_len):
+        mem_past_i = self.memory_past[index]  # (K,)
+        mem_fut_i = self.memory_fut[index]    # (K,)
+
+        zero_padding = torch.zeros(1, 1, self.dim_embedding_key * 2, device=device)
+        present = torch.zeros(1, self.coord_dim, device=device)  # (1,3)
+        prediction_single = torch.empty(0, device=device)
+
+        info_total = torch.cat((mem_past_i, mem_fut_i), 0)       # (2K,)
+        input_dec = info_total.unsqueeze(0).unsqueeze(0)         # (1,1,2K)
+        state_dec = zero_padding                                 # (1,1,2K) for their decoder
+
+        for _ in range(self.future_len):
             output_decoder, state_dec = self.decoder(input_dec, state_dec)
-            displacement_next = self.FC_output(output_decoder)
-            coords_next = present + displacement_next.squeeze(0).unsqueeze(1)
-            prediction_single = torch.cat((prediction_single, coords_next), 1)
+            displacement_next = self.FC_output(output_decoder)   # should be (1,1,3)
+            coords_next = present + displacement_next.squeeze(0).unsqueeze(1)  # (1,1,3)
+            prediction_single = torch.cat((prediction_single, coords_next), 1) # (1,t,3)
             present = coords_next
             input_dec = zero_padding
+
         return prediction_single
 
     def forward(self, past, future=None):
         """
-        Forward pass.
-        Train phase: training writing controller based on reconstruction error of the future.
-        Test phase: Predicts future trajectory based on past trajectory and the future feature read from the memory.
-        :param past: past trajectory
-        :param future: future trajectory (in test phase)
-        :return: predicted future (test phase), writing probability and tolerance rate (train phase)
-        """
+        Test phase (future=None):
+          returns prediction: (B, num_prediction, Tf, 3)
 
-        dim_batch = past.size()[0]
-        zero_padding = torch.zeros(1, dim_batch, self.dim_embedding_key * 2)
-        prediction = torch.Tensor()
-        present_temp = past[:, -1].unsqueeze(1)
-        if self.use_cuda:
-            zero_padding = zero_padding.cuda()
-            prediction = prediction.cuda()
+        Train phase (future provided):
+          returns (writing_prob, tolerance_rate) and writes to memory for items passing controller
+        """
+        device = self._device()
+
+        dim_batch = past.size(0)
+        zero_padding = torch.zeros(1, dim_batch, self.dim_embedding_key * 2, device=device)
+        prediction = torch.empty(0, device=device)  # will cat along pred dimension
+        present_temp = past[:, -1].unsqueeze(1)     # (B,1,3)
 
         # past temporal encoding
-        past = torch.transpose(past, 1, 2)
-        story_embed = self.relu(self.conv_past(past))
+        past_t = torch.transpose(past, 1, 2)             # (B,3,Tp)
+        story_embed = self.relu(self.conv_past(past_t))
         story_embed = torch.transpose(story_embed, 1, 2)
-        output_past, state_past = self.encoder_past(story_embed)
+        _, state_past = self.encoder_past(story_embed)   # (1,B,K) or (L,B,K)
 
-        # Cosine similarity and memory read
-        past_normalized = F.normalize(self.memory_past, p=2, dim=1)
-        state_normalized = F.normalize(state_past.squeeze(), p=2, dim=1)
-        self.weight_read = torch.matmul(past_normalized, state_normalized.transpose(0, 1)).transpose(0, 1)
-        self.index_max = torch.sort(self.weight_read, descending=True)[1].cpu()
+        # Cosine similarity and memory read (exact original logic)
+        past_normalized = F.normalize(self.memory_past, p=2, dim=1)                 # (M,K)
+        state_normalized = F.normalize(state_past.squeeze(), p=2, dim=1)           # (B,K)
+        self.weight_read = torch.matmul(
+            past_normalized, state_normalized.transpose(0, 1)
+        ).transpose(0, 1)                                                          # (B,M)
+        self.index_max = torch.sort(self.weight_read, descending=True)[1].cpu()    # (B,M)
 
+        # Decode for top-k retrieved futures
         for i_track in range(self.num_prediction):
             present = present_temp
-            prediction_single = torch.Tensor().cuda()
-            ind = self.index_max[:, i_track]
-            info_future = self.memory_fut[ind]
-            info_total = torch.cat((state_past, info_future.unsqueeze(0)), 2)
+            prediction_single = torch.empty(0, device=device)
+            ind = self.index_max[:, i_track]              # (B,)
+            info_future = self.memory_fut[ind.to(device)] # (B,K)
+
+            # concatenate current state_past with retrieved future embedding
+            # state_past expected (1,B,K) ; info_future.unsqueeze(0) -> (1,B,K)
+            info_total = torch.cat((state_past, info_future.unsqueeze(0)), 2)  # (1,B,2K)
             input_dec = info_total
             state_dec = zero_padding
-            for i in range(self.future_len):
+
+            for _ in range(self.future_len):
                 output_decoder, state_dec = self.decoder(input_dec, state_dec)
-                displacement_next = self.FC_output(output_decoder)
-                coords_next = present + displacement_next.squeeze(0).unsqueeze(1)
-                prediction_single = torch.cat((prediction_single, coords_next), 1)
+                displacement_next = self.FC_output(output_decoder)  # (1,B,3)
+                coords_next = present + displacement_next.squeeze(0).unsqueeze(1)  # (B,1,3)
+                prediction_single = torch.cat((prediction_single, coords_next), 1) # (B,t,3)
                 present = coords_next
                 input_dec = zero_padding
-            prediction = torch.cat((prediction, prediction_single.unsqueeze(1)), 1)
 
+            prediction = torch.cat((prediction, prediction_single.unsqueeze(1)), 1) # (B,i_track,t,3)
+
+        # === Training phase (writing controller) ===
         if future is not None:
-            future_rep = future.unsqueeze(1).repeat(1, self.num_prediction, 1, 1)
-            distances = torch.norm(prediction - future_rep, dim=3)
+            # future: (B,Tf,3)
+            future_rep = future.unsqueeze(1).repeat(1, self.num_prediction, 1, 1)   # (B,K,Tf,3)
+            distances = torch.norm(prediction - future_rep, dim=3)                  # (B,K,Tf)
+
+            # NOTE: thresholds are in *meters* if xyz is meters.
+            # Your z is altitude (negative down in NED) - still meters, so OK.
             tolerance_1s = torch.sum(distances[:, :, :10] < 0.5, dim=2)
             tolerance_2s = torch.sum(distances[:, :, 10:20] < 1.0, dim=2)
             tolerance_3s = torch.sum(distances[:, :, 20:30] < 1.5, dim=2)
-            tolerance_4s = torch.sum(distances[:, :, 30:40] < 2, dim=2)
+            tolerance_4s = torch.sum(distances[:, :, 30:40] < 2.0, dim=2)
             tolerance = tolerance_1s + tolerance_2s + tolerance_3s + tolerance_4s
-            tolerance_rate = torch.max(tolerance, dim=1)[0].type(torch.FloatTensor) / 40
-            tolerance_rate = tolerance_rate.unsqueeze(1).cuda()
 
-            # controller
-            writing_prob = torch.sigmoid(self.linear_controller(tolerance_rate))
+            tolerance_rate = torch.max(tolerance, dim=1)[0].float() / 40.0          # (B,)
+            tolerance_rate = tolerance_rate.unsqueeze(1).to(device)                 # (B,1)
 
-            # future encoding
-            future = torch.transpose(future, 1, 2)
-            future_embed = self.relu(self.conv_fut(future))
+            writing_prob = torch.sigmoid(self.linear_controller(tolerance_rate))    # (B,1)
+
+            # future encoding (for candidates to write)
+            fut_t = torch.transpose(future, 1, 2)             # (B,3,Tf)
+            future_embed = self.relu(self.conv_fut(fut_t))
             future_embed = torch.transpose(future_embed, 1, 2)
-            output_fut, state_fut = self.encoder_fut(future_embed)
+            _, state_fut = self.encoder_fut(future_embed)     # (1,B,K)
 
-            index_writing = np.where(writing_prob.cpu() > 0.5)[0]
-            past_to_write = state_past.squeeze()[index_writing]
-            future_to_write = state_fut.squeeze()[index_writing]
+            index_writing = np.where(writing_prob.detach().cpu().numpy() > 0.5)[0]
+            if len(index_writing) > 0:
+                past_to_write = state_past.squeeze()[index_writing]   # (n,K)
+                future_to_write = state_fut.squeeze()[index_writing]  # (n,K)
 
-            self.memory_past = torch.cat((self.memory_past, past_to_write), 0)
-            self.memory_fut = torch.cat((self.memory_fut, future_to_write), 0)
+                self.memory_past = torch.cat((self.memory_past, past_to_write), 0)
+                self.memory_fut = torch.cat((self.memory_fut, future_to_write), 0)
 
-        else:
-            return prediction
+            return writing_prob, tolerance_rate
 
-        return writing_prob, tolerance_rate
+        # === Test phase ===
+        return prediction
 
     def write_in_memory(self, past, future):
         """
-        Writing controller decides if the pair past-future will be inserted in memory.
-        :param past: past trajectory
-        :param future: future trajectory
+        Same as original: decides if past-future will be inserted in memory.
+        Uses tolerance-based writing controller.
         """
+        device = self._device()
 
         if self.memory_past.shape[0] < self.num_prediction:
-            num_prediction = self.memory_past.shape[0]
+            num_prediction = int(self.memory_past.shape[0])
         else:
             num_prediction = self.num_prediction
 
-        dim_batch = past.size()[0]
-        zero_padding = torch.zeros(1, dim_batch, self.dim_embedding_key * 2).cuda()
-        prediction = torch.Tensor().cuda()
+        dim_batch = past.size(0)
+        zero_padding = torch.zeros(1, dim_batch, self.dim_embedding_key * 2, device=device)
+        prediction = torch.empty(0, device=device)
         present_temp = past[:, -1].unsqueeze(1)
 
         # past temporal encoding
-        past = torch.transpose(past, 1, 2)
-        story_embed = self.relu(self.conv_past(past))
+        past_t = torch.transpose(past, 1, 2)
+        story_embed = self.relu(self.conv_past(past_t))
         story_embed = torch.transpose(story_embed, 1, 2)
-        output_past, state_past = self.encoder_past(story_embed)
+        _, state_past = self.encoder_past(story_embed)
 
         # Cosine similarity and memory read
         past_normalized = F.normalize(self.memory_past, p=2, dim=1)
@@ -214,46 +253,48 @@ class model_controllerMem(nn.Module):
 
         for i_track in range(num_prediction):
             present = present_temp
-            prediction_single = torch.Tensor().cuda()
+            prediction_single = torch.empty(0, device=device)
             ind = index_max[:, i_track]
-            info_future = self.memory_fut[ind]
+            info_future = self.memory_fut[ind.to(device)]
             info_total = torch.cat((state_past, info_future.unsqueeze(0)), 2)
             input_dec = info_total
             state_dec = zero_padding
-            for i in range(self.future_len):
+
+            for _ in range(self.future_len):
                 output_decoder, state_dec = self.decoder(input_dec, state_dec)
-                displacement_next = self.FC_output(output_decoder)
+                displacement_next = self.FC_output(output_decoder)  # (1,B,3)
                 coords_next = present + displacement_next.squeeze(0).unsqueeze(1)
                 prediction_single = torch.cat((prediction_single, coords_next), 1)
                 present = coords_next
                 input_dec = zero_padding
+
             prediction = torch.cat((prediction, prediction_single.unsqueeze(1)), 1)
 
         future_rep = future.unsqueeze(1).repeat(1, num_prediction, 1, 1)
         distances = torch.norm(prediction - future_rep, dim=3)
+
         tolerance_1s = torch.sum(distances[:, :, :10] < 0.5, dim=2)
-        tolerance_2s = torch.sum(distances[:, :, 10:20] < 1, dim=2)
+        tolerance_2s = torch.sum(distances[:, :, 10:20] < 1.0, dim=2)
         tolerance_3s = torch.sum(distances[:, :, 20:30] < 1.5, dim=2)
-        tolerance_4s = torch.sum(distances[:, :, 30:40] < 2, dim=2)
+        tolerance_4s = torch.sum(distances[:, :, 30:40] < 2.0, dim=2)
         tolerance = tolerance_1s + tolerance_2s + tolerance_3s + tolerance_4s
 
-        tolerance_rate = torch.max(tolerance, dim=1)[0].type(torch.FloatTensor) / 40
-        tolerance_rate = tolerance_rate.unsqueeze(1).cuda()
+        tolerance_rate = torch.max(tolerance, dim=1)[0].float() / 40.0
+        tolerance_rate = tolerance_rate.unsqueeze(1).to(device)
 
-        # writing controller
         writing_prob = torch.sigmoid(self.linear_controller(tolerance_rate))
 
         # future encoding
-        future = torch.transpose(future, 1, 2)
-        future_embed = self.relu(self.conv_fut(future))
+        fut_t = torch.transpose(future, 1, 2)
+        future_embed = self.relu(self.conv_fut(fut_t))
         future_embed = torch.transpose(future_embed, 1, 2)
-        output_fut, state_fut = self.encoder_fut(future_embed)
+        _, state_fut = self.encoder_fut(future_embed)
 
-        # index of elements to be added in memory
-        index_writing = np.where(writing_prob.cpu() > 0.5)[0]
-        past_to_write = state_past.squeeze()[index_writing]
-        future_to_write = state_fut.squeeze()[index_writing]
-        self.memory_past = torch.cat((self.memory_past, past_to_write), 0)
-        self.memory_fut = torch.cat((self.memory_fut, future_to_write), 0)
+        index_writing = np.where(writing_prob.detach().cpu().numpy() > 0.5)[0]
+        if len(index_writing) > 0:
+            past_to_write = state_past.squeeze()[index_writing]
+            future_to_write = state_fut.squeeze()[index_writing]
+            self.memory_past = torch.cat((self.memory_past, past_to_write), 0)
+            self.memory_fut = torch.cat((self.memory_fut, future_to_write), 0)
 
-
+        return writing_prob, tolerance_rate

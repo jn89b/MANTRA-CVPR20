@@ -8,9 +8,10 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from dataset_evasion import MantraJsonDataset3D, mantra_collate_3d
+
 from tensorboardX import SummaryWriter
 from models.model_encdec import model_encdec
-import dataset_invariance
 from torch.autograd import Variable
 import tqdm
 
@@ -24,43 +25,84 @@ class Trainer:
 
         # test folder creating
         self.name_test = str(datetime.datetime.now())[:13]
-        self.folder_tensorboard = 'runs/runs-ae/'
-        self.folder_test = 'training/training_ae/' + self.name_test + '_' + config.info
+        self.folder_tensorboard = "runs/runs-ae/"
+        self.folder_test = "training/training_ae/" + self.name_test + "_" + config.info
         if not os.path.exists(self.folder_test):
             os.makedirs(self.folder_test)
-        self.folder_test = self.folder_test + '/'
+        self.folder_test = self.folder_test + "/"
         self.file = open(self.folder_test + "details.txt", "w")
 
-        print('Creating dataset...')
-        tracks = json.load(open(config.dataset_file))
-        self.dim_clip = 180
-        self.data_train = dataset_invariance.TrackDataset(tracks,
-                                                          len_past=config.past_len,
-                                                          len_future=config.future_len,
-                                                          train=True,
-                                                          dim_clip=self.dim_clip)
-        self.train_loader = DataLoader(self.data_train,
-                                       batch_size=config.batch_size,
-                                       num_workers=1,
-                                       shuffle=True
-                                       )
-        self.data_test = dataset_invariance.TrackDataset(tracks,
-                                                         len_past=config.past_len,
-                                                         len_future=config.future_len,
-                                                         train=False,
-                                                         dim_clip=self.dim_clip)
-        self.test_loader = DataLoader(self.data_test,
-                                      batch_size=config.batch_size,
-                                      num_workers=1,
-                                      shuffle=False
-                                      )
-        print('Dataset created')
+        print("Creating dataset...")
 
+        # (optional legacy read)
+        if getattr(config, "dataset_file", None) is not None and os.path.exists(config.dataset_file):
+            _ = json.load(open(config.dataset_file))
+
+        # -------------------------
+        # Datasets / Loaders
+        # -------------------------
+        self.data_train = MantraJsonDataset3D(
+            data_path=getattr(config, "train_data_path", "data/train/"),
+            past_len=config.past_len,
+            future_len=config.future_len,
+            step_size=getattr(config, "step_size", 1),
+            use_ego_frame=getattr(config, "use_ego_frame", True),
+            return_dummy_scene=True,
+        )
+        self.train_loader = DataLoader(
+            self.data_train,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=getattr(config, "num_workers_train", 8),
+            pin_memory=True,
+            collate_fn=mantra_collate_3d,
+        )
+
+        self.data_val = MantraJsonDataset3D(
+            data_path=getattr(config, "val_data_path", "data/val/"),
+            past_len=config.past_len,
+            future_len=config.future_len,
+            step_size=getattr(config, "step_size", 1),
+            use_ego_frame=getattr(config, "use_ego_frame", True),
+            return_dummy_scene=True,
+        )
+        self.val_loader = DataLoader(
+            self.data_val,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=getattr(config, "num_workers_eval", 1),
+            pin_memory=True,
+            collate_fn=mantra_collate_3d,
+        )
+
+        self.data_test = MantraJsonDataset3D(
+            data_path=getattr(config, "test_data_path", "data/test/"),
+            past_len=config.past_len,
+            future_len=config.future_len,
+            step_size=getattr(config, "step_size", 1),
+            use_ego_frame=getattr(config, "use_ego_frame", True),
+            return_dummy_scene=True,
+        )
+        self.test_loader = DataLoader(
+            self.data_test,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=getattr(config, "num_workers_eval", 1),
+            pin_memory=True,
+            collate_fn=mantra_collate_3d,
+        )
+
+        print("Dataset created")
+
+        # -------------------------
+        # Settings / Model
+        # -------------------------
         self.settings = {
             "batch_size": config.batch_size,
             "use_cuda": config.cuda,
-            "dim_feature_tracklet": config.past_len * 2,
-            "dim_feature_future": config.future_len * 2,
+            # legacy fields (not used by our AE, but keep if your code expects them)
+            "dim_feature_tracklet": config.past_len * 3,
+            "dim_feature_future": config.future_len * 3,
             "dim_embedding_key": config.dim_embedding_key,
             "past_len": config.past_len,
             "future_len": config.future_len,
@@ -75,192 +117,225 @@ class Trainer:
 
         self.opt = torch.optim.Adam(self.mem_n2n.parameters(), lr=config.learning_rate)
         self.iterations = 0
+        self.start_epoch = 0
+        self.config = config
+
         if config.cuda:
             self.criterionLoss = self.criterionLoss.cuda()
             self.mem_n2n = self.mem_n2n.cuda()
-        self.start_epoch = 0
-        self.config = config
+
+        # Best validation tracking
+        self.best_val = float("inf")
 
         # Write details to file
         self.write_details()
         self.file.close()
 
         # Tensorboard summary: configuration
-        self.writer = SummaryWriter(self.folder_tensorboard + self.name_test + '_' + config.info)
-        self.writer.add_text('Training Configuration', 'model name: {}'.format(self.mem_n2n.name_model), 0)
-        self.writer.add_text('Training Configuration', 'dataset train: {}'.format(len(self.data_train)), 0)
-        self.writer.add_text('Training Configuration', 'dataset test: {}'.format(len(self.data_test)), 0)
-        self.writer.add_text('Training Configuration', 'batch_size: {}'.format(self.config.batch_size), 0)
-        self.writer.add_text('Training Configuration', 'learning rate init: {}'.format(self.config.learning_rate), 0)
-        self.writer.add_text('Training Configuration', 'dim_embedding_key: {}'.format(self.config.dim_embedding_key), 0)
+        self.writer = SummaryWriter(self.folder_tensorboard + self.name_test + "_" + config.info)
+        self.writer.add_text("Training Configuration", "model name: {}".format(self.mem_n2n.name_model), 0)
+        self.writer.add_text("Training Configuration", "dataset train: {}".format(len(self.data_train)), 0)
+        self.writer.add_text("Training Configuration", "dataset val: {}".format(len(self.data_val)), 0)
+        self.writer.add_text("Training Configuration", "dataset test: {}".format(len(self.data_test)), 0)
+        self.writer.add_text("Training Configuration", "batch_size: {}".format(self.config.batch_size), 0)
+        self.writer.add_text("Training Configuration", "learning rate init: {}".format(self.config.learning_rate), 0)
+        self.writer.add_text("Training Configuration", "dim_embedding_key: {}".format(self.config.dim_embedding_key), 0)
 
     def write_details(self):
         """
         Serialize configuration parameters to file.
         """
+        self.file.write("points of past track: {}".format(self.config.past_len) + "\n")
+        self.file.write("points of future track: {}".format(self.config.future_len) + "\n")
+        self.file.write("train size: {}".format(len(self.data_train)) + "\n")
+        self.file.write("val size: {}".format(len(self.data_val)) + "\n")
+        self.file.write("test size: {}".format(len(self.data_test)) + "\n")
+        self.file.write("batch size: {}".format(self.config.batch_size) + "\n")
+        self.file.write("learning rate: {}".format(self.config.learning_rate) + "\n")
+        self.file.write("embedding dim: {}".format(self.config.dim_embedding_key) + "\n")
 
-        self.file.write('points of past track: {}'.format(self.config.past_len) + '\n')
-        self.file.write('points of future track: {}'.format(self.config.future_len) + '\n')
-        self.file.write('train size: {}'.format(len(self.data_train)) + '\n')
-        self.file.write('test size: {}'.format(len(self.data_test)) + '\n')
-        self.file.write('batch size: {}'.format(self.config.batch_size) + '\n')
-        self.file.write('learning rate: {}'.format(self.config.learning_rate) + '\n')
-        self.file.write('embedding dim: {}'.format(self.config.dim_embedding_key) + '\n')
-
-    def draw_track(self, past, future, pred=None, index_tracklet=0, num_epoch=0, train=False):
+    def draw_track(self, past, future, pred=None, index_tracklet=0, num_epoch=0, tag="test"):
         """
-        Plot past and future trajectory and save it to tensorboard.
-        :param past: the observed trajectory
-        :param future: ground truth future trajectory
-        :param pred: predicted future trajectory
-        :param index_tracklet: index of the trajectory in the dataset (default 0)
-        :param num_epoch: current epoch (default 0)
-        :param train: True or False, indicates whether the sample is in the training or testing set
-        :return: None
+        Plot past and future trajectory and save it to tensorboard (XY only).
         """
-
         fig = plt.figure()
-        past = past.cpu().numpy()
-        future = future.cpu().numpy()
-        plt.plot(past[:, 0], past[:, 1], c='blue', marker='o', markersize=3)
-        plt.plot(future[:, 0], future[:, 1], c='green', marker='o', markersize=3)
-        if pred is not None:
-            pred = pred.cpu().numpy()
-            plt.plot(pred[:, 0], pred[:, 1], color='red', linewidth=1, marker='o', markersize=1)
-        plt.axis('equal')
+        past_np = past.detach().cpu().numpy()
+        fut_np = future.detach().cpu().numpy()
 
-        # Save figure in Tensorboard
+        plt.plot(past_np[:, 0], past_np[:, 1], c="blue", marker="o", markersize=3)
+        plt.plot(fut_np[:, 0], fut_np[:, 1], c="green", marker="o", markersize=3)
+
+        if pred is not None:
+            pred_np = pred.detach().cpu().numpy()
+            plt.plot(pred_np[:, 0], pred_np[:, 1], color="red", linewidth=1, marker="o", markersize=1)
+
+        plt.axis("equal")
+
         buf = io.BytesIO()
-        plt.savefig(buf, format='jpeg')
+        plt.savefig(buf, format="jpeg")
         buf.seek(0)
         image = Image.open(buf)
         image = ToTensor()(image).unsqueeze(0)
 
-        if train:
-            self.writer.add_image('Image_train/track' + str(index_tracklet), image.squeeze(0), num_epoch)
-        else:
-            self.writer.add_image('Image_test/track' + str(index_tracklet), image.squeeze(0), num_epoch)
-
+        self.writer.add_image(f"Image_{tag}/track{index_tracklet}", image.squeeze(0), num_epoch)
         plt.close(fig)
 
     def fit(self):
         """
-        Autoencoder training procedure. The function loops over the data in the training set max_epochs times.
-        :return: None
+        Autoencoder training procedure.
         """
         config = self.config
-        # Training loop
+
         for epoch in range(self.start_epoch, config.max_epochs):
-
-            print(' ----- Epoch: {}'.format(epoch))
+            print(f"----- Epoch: {epoch}")
             loss = self._train_single_epoch()
-            print('Loss: {}'.format(loss))
+            print(f"Loss: {loss}")
 
-            if (epoch + 1) % 20 == 0:
-                print('test on train dataset')
-                dict_metrics_train = self.evaluate(self.train_loader, epoch + 1)
+            # Always validate each epoch
+            dict_metrics_val = self.evaluate(self.val_loader, epoch=epoch + 1, tag="val", draw=False)
 
-                print('test on TEST dataset')
-                dict_metrics_test = self.evaluate(self.test_loader, epoch + 1)
+            # Tensorboard: LR
+            for param_group in self.opt.param_groups:
+                self.writer.add_scalar("learning_rate", param_group["lr"], epoch)
 
-                # Tensorboard summary: learning rate
-                for param_group in self.opt.param_groups:
-                    self.writer.add_scalar('learning_rate', param_group["lr"], epoch)
+            # Tensorboard: val metrics
+            self.writer.add_scalar("accuracy_val/eucl_mean", dict_metrics_val["eucl_mean"], epoch)
+            self.writer.add_scalar("accuracy_val/Horizon10", dict_metrics_val["horizon10"], epoch)
+            self.writer.add_scalar("accuracy_val/Horizon20", dict_metrics_val["horizon20"], epoch)
+            self.writer.add_scalar("accuracy_val/Horizon30", dict_metrics_val["horizon30"], epoch)
+            self.writer.add_scalar("accuracy_val/Horizon40", dict_metrics_val["horizon40"], epoch)
 
-                # Tensorboard summary: train
-                self.writer.add_scalar('accuracy_train/eucl_mean', dict_metrics_train['eucl_mean'], epoch)
-                self.writer.add_scalar('accuracy_train/Horizon10s', dict_metrics_train['horizon10s'], epoch)
-                self.writer.add_scalar('accuracy_train/Horizon20s', dict_metrics_train['horizon20s'], epoch)
-                self.writer.add_scalar('accuracy_train/Horizon30s', dict_metrics_train['horizon30s'], epoch)
-                self.writer.add_scalar('accuracy_train/Horizon40s', dict_metrics_train['horizon40s'], epoch)
+            # Save best checkpoint by val eucl_mean
+            if dict_metrics_val["eucl_mean"] < self.best_val:
+                self.best_val = dict_metrics_val["eucl_mean"]
+                torch.save(self.mem_n2n.state_dict(), self.folder_test + "best_val.pt")
 
-                # Tensorboard summary: test
-                self.writer.add_scalar('accuracy_test/eucl_mean', dict_metrics_test['eucl_mean'], epoch)
-                self.writer.add_scalar('accuracy_test/Horizon10s', dict_metrics_test['horizon10s'], epoch)
-                self.writer.add_scalar('accuracy_test/Horizon20s', dict_metrics_test['horizon20s'], epoch)
-                self.writer.add_scalar('accuracy_test/Horizon30s', dict_metrics_test['horizon30s'], epoch)
-                self.writer.add_scalar('accuracy_test/Horizon40s', dict_metrics_test['horizon40s'], epoch)
+            # Periodic evaluation on train and test
+            eval_every = getattr(config, "eval_every", 1)
+            
+            if (epoch + 1) % eval_every == 0:
+                print("eval on TRAIN dataset")
+                dict_metrics_train = self.evaluate(self.train_loader, epoch=epoch + 1, tag="train", draw=False)
 
-                # Save model checkpoint
-                torch.save(self.mem_n2n, self.folder_test + 'model_ae_epoch_' + str(epoch) + '_' + self.name_test)
+                print("eval on TEST dataset")
+                dict_metrics_test = self.evaluate(self.test_loader, epoch=epoch + 1, tag="test", draw=True)
 
-                # Tensorboard summary: model weights
+                # Tensorboard: train metrics
+                self.writer.add_scalar("accuracy_train/eucl_mean", dict_metrics_train["eucl_mean"], epoch)
+                self.writer.add_scalar("accuracy_train/Horizon10", dict_metrics_train["horizon10"], epoch)
+                self.writer.add_scalar("accuracy_train/Horizon20", dict_metrics_train["horizon20"], epoch)
+                self.writer.add_scalar("accuracy_train/Horizon30", dict_metrics_train["horizon30"], epoch)
+                self.writer.add_scalar("accuracy_train/Horizon40", dict_metrics_train["horizon40"], epoch)
+
+                # Tensorboard: test metrics
+                self.writer.add_scalar("accuracy_test/eucl_mean", dict_metrics_test["eucl_mean"], epoch)
+                self.writer.add_scalar("accuracy_test/Horizon10", dict_metrics_test["horizon10"], epoch)
+                self.writer.add_scalar("accuracy_test/Horizon20", dict_metrics_test["horizon20"], epoch)
+                self.writer.add_scalar("accuracy_test/Horizon30", dict_metrics_test["horizon30"], epoch)
+                self.writer.add_scalar("accuracy_test/Horizon40", dict_metrics_test["horizon40"], epoch)
+
+                # Save periodic checkpoint
+                # include the epoch and val eucl_mean in the filename for easier tracking of checkpoints
+                name_checkpoint = f"model_ae_epoch_{epoch}_{self.name_test}_val{dict_metrics_val['eucl_mean']:.4f}.ckpt"
+                torch.save(self.mem_n2n.state_dict(), self.folder_test + name_checkpoint)
+
+                # Tensorboard: model weights histogram
                 for name, param in self.mem_n2n.named_parameters():
                     self.writer.add_histogram(name, param.data, epoch)
 
         # Save final trained model
-        torch.save(self.mem_n2n, self.folder_test + 'model_ae_' + self.name_test)
+        name_checkpoint = f"model_ae_final_{self.name_test}.ckpt"
+        torch.save(self.mem_n2n.state_dict(), self.folder_test + name_checkpoint)
 
-    def evaluate(self, loader, epoch=0):
+    def evaluate(self, loader, epoch=0, tag="test", draw=False):
         """
         Evaluate the model.
-        :param loader: pytorch dataloader to loop over the data
-        :param epoch: current epoch (default 0)
-        :return: a dictionary with performance metrics
+        Returns dict with metrics:
+          eucl_mean: mean over samples of mean distance over horizon
+          horizon10/20/30/40: distance at those indices if available else 0
         """
+        was_training = self.mem_n2n.training
+        self.mem_n2n.eval()
 
-        eucl_mean = horizon10s = horizon20s = horizon30s = horizon40s = 0
-        dict_metrics = {}
+        eucl_mean = 0.0
+        horizon10 = 0.0
+        horizon20 = 0.0
+        horizon30 = 0.0
+        horizon40 = 0.0
 
-        # Loop over samples
-        for step, (index, past, future, presents, angle_presents, videos, vehicles, number_vec, scene, scene_one_hot) \
-                in enumerate(tqdm.tqdm(loader)):
-            past = Variable(past)
-            future = Variable(future)
-            if self.config.cuda:
-                past = past.cuda()
-                future = future.cuda()
-            pred = self.mem_n2n(past, future).data
+        with torch.no_grad():
+            for step, batch in enumerate(tqdm.tqdm(loader)):
+                past = batch["past"]
+                future = batch["future"]
 
-            distances = torch.norm(pred - future, dim=2)
-            eucl_mean += torch.sum(torch.mean(distances, 1))
-            horizon10s += torch.sum(distances[:, 9])
-            horizon20s += torch.sum(distances[:, 19])
-            horizon30s += torch.sum(distances[:, 29])
-            horizon40s += torch.sum(distances[:, 39])
+                if self.config.cuda:
+                    past = past.cuda(non_blocking=True)
+                    future = future.cuda(non_blocking=True)
 
-            # Draw sample: the first of the batch
-            if loader == self.test_loader:
-                self.draw_track(past[0],
-                                future[0],
-                                pred[0],
-                                index_tracklet=step,
-                                num_epoch=epoch,
-                                train=False
-                                )
+                pred = self.mem_n2n(past, future)
 
-        dict_metrics['eucl_mean'] = eucl_mean / len(loader.dataset)
-        dict_metrics['horizon10s'] = horizon10s / len(loader.dataset)
-        dict_metrics['horizon20s'] = horizon20s / len(loader.dataset)
-        dict_metrics['horizon30s'] = horizon30s / len(loader.dataset)
-        dict_metrics['horizon40s'] = horizon40s / len(loader.dataset)
+                distances = torch.norm(pred - future, dim=2)  # (B,Tf)
+                eucl_mean += torch.sum(torch.mean(distances, dim=1)).item()
+
+                Tf = distances.size(1)
+                if Tf >= 10:
+                    horizon10 += torch.sum(distances[:, 9]).item()
+                if Tf >= 20:
+                    horizon20 += torch.sum(distances[:, 19]).item()
+                if Tf >= 30:
+                    horizon30 += torch.sum(distances[:, 29]).item()
+                if Tf >= 40:
+                    horizon40 += torch.sum(distances[:, 39]).item()
+
+                if draw and step < getattr(self.config, "num_draw_batches", 20):
+                    self.draw_track(
+                        past[0],
+                        future[0],
+                        pred[0],
+                        index_tracklet=step,
+                        num_epoch=epoch,
+                        tag=tag,
+                    )
+
+        n = len(loader.dataset)
+        dict_metrics = {
+            "eucl_mean": eucl_mean / n,
+            "horizon10": horizon10 / n,
+            "horizon20": horizon20 / n,
+            "horizon30": horizon30 / n,
+            "horizon40": horizon40 / n,
+        }
+
+        if was_training:
+            self.mem_n2n.train()
 
         return dict_metrics
 
     def _train_single_epoch(self):
         """
-        Training loop over the dataset for an epoch
-        :return: loss
+        Training loop over the dataset for an epoch.
         """
+        self.mem_n2n.train()
         config = self.config
-        for step, (index, past, future, presents, angle_presents, videos, vehicles, number_vec, scene, scene_one_hot) \
-                in enumerate(tqdm.tqdm(self.train_loader)):
-            self.iterations += 1
-            past = Variable(past)
-            future = Variable(future)
-            if config.cuda:
-                past = past.cuda()
-                future = future.cuda()
-            self.opt.zero_grad()
+        last_loss = None
 
-            # Get prediction and compute loss
+        for step, batch in enumerate(tqdm.tqdm(self.train_loader)):
+            self.iterations += 1
+            past = Variable(batch["past"])
+            future = Variable(batch["future"])
+
+            if config.cuda:
+                past = past.cuda(non_blocking=True)
+                future = future.cuda(non_blocking=True)
+
+            self.opt.zero_grad()
             output = self.mem_n2n(past, future)
             loss = self.criterionLoss(output, future)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.mem_n2n.parameters(), 1.0, norm_type=2)
             self.opt.step()
 
-            # Tensorboard summary: loss
-            self.writer.add_scalar('loss/loss_total', loss, self.iterations)
+            self.writer.add_scalar("loss/loss_total", loss.item(), self.iterations)
+            last_loss = loss
 
-        return loss.item()
+        return float(last_loss.item() if last_loss is not None else 0.0)

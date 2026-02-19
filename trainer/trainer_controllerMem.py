@@ -149,7 +149,7 @@ class Trainer():
             print('Epoch took: {} Loss: {}'.format(end - start, loss))
             self.save_plot_controller(epoch)
 
-            if (epoch + 1) % 20 == 0:
+            if (epoch + 1) % 5 == 0:
                 # Test model while training
                 print('start test')
                 start_test = time.time()
@@ -165,7 +165,7 @@ class Trainer():
                 self.writer.add_scalar('accuracy_test/Horizon40s', dict_metrics_test['horizon40s'], epoch)
 
                 # Save model checkpoint
-                torch.save(self.mem_n2n, self.folder_test + 'model_controller_epoch_' + str(epoch) + '_' + self.name_test)
+                torch.save(self.mem_n2n, self.folder_test + 'model_controller_epoch_' + str(epoch) + '_' + self.name_test + '.ckpt')
 
                 # print memory on tensorboard
                 mem_size = self.mem_n2n.memory_past.shape[0]
@@ -188,7 +188,7 @@ class Trainer():
                 self.writer.add_histogram(name, param.data, epoch)
 
         # Save final trained model
-        torch.save(self.mem_n2n, self.folder_test + 'model_controller_' + self.name_test)
+        torch.save(self.mem_n2n, self.folder_test + 'model_controller_' + self.name_test + '.ckpt')
 
     def save_plot_controller(self, epoch):
         """

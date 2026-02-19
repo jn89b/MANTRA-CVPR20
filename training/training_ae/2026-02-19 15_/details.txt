@@ -1,0 +1,8 @@
+points of past track: 21
+points of future track: 20
+train size: 11726
+val size: 11726
+test size: 11726
+batch size: 32
+learning rate: 0.0001
+embedding dim: 48
