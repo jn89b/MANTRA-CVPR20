@@ -8,7 +8,7 @@ import torch.optim as optim
 import pytorch_lightning as pl
 
 class IRMLightning(pl.LightningModule):
-    def __init__(self, settings: Dict[str, Any], model_pretrained: nn.Module):
+    def __init__(self, settings: Dict[str, Any], model_pretrained: nn.Module=None):
         super().__init__()
         self.save_hyperparameters(settings)
         self.name_model = "MANTRA_IRM"
@@ -24,15 +24,25 @@ class IRMLightning(pl.LightningModule):
         self.register_buffer("memory_past", torch.empty(0, self.dim_embedding_key))
         self.register_buffer("memory_fut", torch.empty(0, self.dim_embedding_key))
 
-        # Layers (Re-use pretrained components from Controller)
-        self.conv_past = model_pretrained.conv_past
-        self.conv_fut = model_pretrained.conv_fut
-        self.encoder_past = model_pretrained.encoder_past
-        self.encoder_fut = model_pretrained.encoder_fut
-        self.decoder = model_pretrained.decoder
-        self.FC_output = model_pretrained.FC_output
-        self.linear_controller = model_pretrained.linear_controller
-
+        if model_pretrained is not None:
+            self.conv_past = model_pretrained.conv_past
+            self.conv_fut = model_pretrained.conv_fut
+            self.encoder_past = model_pretrained.encoder_past
+            self.encoder_fut = model_pretrained.encoder_fut
+            self.decoder = model_pretrained.decoder
+            self.FC_output = model_pretrained.FC_output
+            self.linear_controller = model_pretrained.linear_controller
+        else:
+            # Architecture Skeleton (Must match ControllerLightning exactly)
+            dim_key = self.hparams["dim_embedding_key"]
+            self.conv_past = nn.Conv1d(3, 16, 3, padding=1)
+            self.conv_fut = nn.Conv1d(3, 16, 3, padding=1)
+            self.encoder_past = nn.GRU(16, dim_key, 1, batch_first=True)
+            self.encoder_fut = nn.GRU(16, dim_key, 1, batch_first=True)
+            self.decoder = nn.GRU(dim_key * 2, dim_key * 2, 1, batch_first=False)
+            self.FC_output = nn.Linear(dim_key * 2, 3)
+            self.linear_controller = nn.Linear(1, 1)
+            
         # Freeze Autoencoder layers
         for part in [self.conv_past, self.conv_fut, self.encoder_past, 
                       self.encoder_fut, self.decoder, self.FC_output]:
@@ -254,6 +264,20 @@ class IRMLightning(pl.LightningModule):
         prob = torch.sigmoid(self.linear_controller(sim))
         return prob, sim
 
+    def on_load_checkpoint(self, checkpoint):
+        """
+        Specifically allows the IRM to ingest the 11k+ memory segments 
+        stored in the checkpoint without a size mismatch error.
+        """
+        if "state_dict" in checkpoint:
+            # Pull shapes from the actual file data
+            p_shape = checkpoint["state_dict"]["memory_past"].shape
+            f_shape = checkpoint["state_dict"]["memory_fut"].shape
+            
+            # Resize current buffers to match
+            self.memory_past = torch.empty(p_shape, device=self.device)
+            self.memory_fut = torch.empty(f_shape, device=self.device)
+
     # -------------------------------------------------------------------------
     # LIGHTNING STEPS
     # -------------------------------------------------------------------------
@@ -274,7 +298,7 @@ class IRMLightning(pl.LightningModule):
         # KEY FIX: Find the index of the BEST modality for each sample in batch
         # We only backpropagate through the "winner"
         min_ade, index_min = torch.min(mean_distances, dim=1) # (B,)
-        
+  
         # Select the best predictions
         best_pred = prediction[torch.arange(past.shape[0]), index_min] # (B, Tf, 3)
         
@@ -291,10 +315,10 @@ class IRMLightning(pl.LightningModule):
         total_loss = refine_loss + cont_loss
         
         # Logging
-        self.log("train/refine_loss", refine_loss, prog_bar=True)
-        self.log("train/cont_loss", cont_loss, prog_bar=False)
-        self.log("train/total_loss", total_loss, prog_bar=True)
-        self.log("mem/size", float(self.memory_past.shape[0]))
+        self.log("train/refine_loss", refine_loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/cont_loss", cont_loss, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("train/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("mem/size", float(self.memory_past.shape[0]), on_epoch=True)
         return total_loss
 
     def validation_step(self, batch, batch_idx):
