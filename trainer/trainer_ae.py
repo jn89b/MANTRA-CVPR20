@@ -287,15 +287,6 @@ class Trainer:
                 if Tf >= 40:
                     horizon40 += torch.sum(distances[:, 39]).item()
 
-                if draw and step < getattr(self.config, "num_draw_batches", 20):
-                    self.draw_track(
-                        past[0],
-                        future[0],
-                        pred[0],
-                        index_tracklet=step,
-                        num_epoch=epoch,
-                        tag=tag,
-                    )
 
         n = len(loader.dataset)
         dict_metrics = {
