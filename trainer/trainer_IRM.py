@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 import matplotlib.pylab as pl
 from matplotlib.colors import LinearSegmentedColormap
 import datetime
-import cv2
 from random import randint
 import numpy as np
 import json
