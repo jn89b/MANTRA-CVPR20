@@ -261,6 +261,7 @@ class Trainer:
         horizon10 = 0.0
         horizon20 = 0.0
         horizon30 = 0.0
+        horizon30 = 0.0
         horizon40 = 0.0
 
         with torch.no_grad():

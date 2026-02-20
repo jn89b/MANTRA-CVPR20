@@ -3,7 +3,204 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import random
+from typing import Dict, Any
+import pytorch_lightning as pl
+import torch.optim as optim
 
+class ControllerLightning(pl.LightningModule):
+    def __init__(self, settings: Dict[str, Any], model_pretrained: nn.Module):
+        super().__init__()
+        self.save_hyperparameters(settings)
+        self.name_model = "writing_controller"
+
+        # parameters
+        self.dim_embedding_key = self.hparams["dim_embedding_key"]
+        self.num_prediction = self.hparams["num_prediction"]
+        self.past_len = self.hparams["past_len"]
+        self.future_len = self.hparams["future_len"]
+        self.coord_dim = 3
+
+        # similarity criterion
+        self.weight_read = []
+        self.index_max = []
+        self.similarity = nn.CosineSimilarity(dim=1)
+
+        # Memory Bank
+        # Registering as buffers ensures Lightning handles device placement and checkpointing
+        self.register_buffer("memory_past", torch.empty(0, self.dim_embedding_key))
+        self.register_buffer("memory_fut", torch.empty(0, self.dim_embedding_key))
+        self.memory_count = []
+
+        # layers (re-use pretrained components)
+        self.conv_past = model_pretrained.conv_past
+        self.conv_fut = model_pretrained.conv_fut
+        self.encoder_past = model_pretrained.encoder_past
+        self.encoder_fut = model_pretrained.encoder_fut
+        self.decoder = model_pretrained.decoder
+        self.FC_output = model_pretrained.FC_output
+
+        # activation functions
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)
+        self.linear_controller = torch.nn.Linear(1, 1)
+
+    def init_memory(self, data_train):
+        """
+        Initialization: write random samples in memory.
+        """
+        # Ensure we are on the correct device (self.device is provided by Lightning)
+        self.memory_past = torch.empty(0, self.dim_embedding_key, device=self.device)
+        self.memory_fut = torch.empty(0, self.dim_embedding_key, device=self.device)
+
+        self.eval() 
+        with torch.no_grad():
+            for _ in range(self.num_prediction + 1):
+                j = random.randint(0, len(data_train) - 1)
+                
+                # Consistent with original MANTRA dataset indexing
+                past = data_train[j][1].unsqueeze(0).to(self.device)    # (1,Tp,3)
+                future = data_train[j][2].unsqueeze(0).to(self.device)  # (1,Tf,3)
+
+                # past encoding
+                past_t = torch.transpose(past, 1, 2)
+                story_embed = self.relu(self.conv_past(past_t))
+                story_embed = torch.transpose(story_embed, 1, 2)
+                _, state_past = self.encoder_past(story_embed)
+
+                # future encoding
+                fut_t = torch.transpose(future, 1, 2)
+                future_embed = self.relu(self.conv_fut(fut_t))
+                future_embed = torch.transpose(future_embed, 1, 2)
+                _, state_fut = self.encoder_fut(future_embed)
+
+                # insert in memory
+                self.memory_past = torch.cat((self.memory_past, state_past.squeeze(0)), 0)
+                self.memory_fut = torch.cat((self.memory_fut, state_fut.squeeze(0)), 0)
+        
+        self.train()
+        print(f"Memory initialized with {self.memory_past.shape[0]} samples.")
+
+    def on_train_start(self) -> None:
+        """
+        Lightning Hook: Called once at the beginning of training.
+        """
+        # Option A: Pull the dataset from the trainer
+        # This assumes your trainer has a datamodule or a train_dataloader set up
+        if self.trainer.datamodule is not None:
+            train_ds = self.trainer.datamodule.data_train # Use your specific attribute name
+        else:
+            train_ds = self.trainer.train_dataloader.dataset
+
+        self.init_memory(train_ds)
+
+        # Logging training start info
+        writer = self.logger.experiment
+        writer.add_text("Config/Model", f"Name: {self.name_model}", 0)
+        writer.add_text("Config/MemorySize", f"Initial: {self.memory_past.shape[0]}", 0)
+
+    def forward(self, past, future=None):
+        dim_batch = past.size(0)
+        zero_padding = torch.zeros(1, dim_batch, self.dim_embedding_key * 2, device=self.device)
+        prediction = torch.empty(0, device=self.device) 
+        present_temp = past[:, -1].unsqueeze(1) 
+
+        # past temporal encoding
+        past_t = torch.transpose(past, 1, 2)
+        story_embed = self.relu(self.conv_past(past_t))
+        story_embed = torch.transpose(story_embed, 1, 2)
+        _, state_past = self.encoder_past(story_embed) 
+
+        # Safety check for empty memory read
+        if self.memory_past.shape[0] == 0:
+            return torch.zeros(dim_batch, self.num_prediction, self.future_len, 3, device=self.device), state_past
+
+        # Cosine similarity and memory read
+        past_normalized = F.normalize(self.memory_past, p=2, dim=1)
+        state_normalized = F.normalize(state_past.squeeze(0), p=2, dim=1)
+        
+        self.weight_read = torch.matmul(state_normalized, past_normalized.transpose(0, 1))
+        self.index_max = torch.sort(self.weight_read, descending=True, dim=1)[1]
+
+        # Decode for top-k retrieved futures
+        for i_track in range(self.num_prediction):
+            present = present_temp
+            prediction_single = torch.empty(0, device=self.device)
+            ind = self.index_max[:, i_track] 
+            info_future = self.memory_fut[ind] 
+
+            info_total = torch.cat((state_past, info_future.unsqueeze(0)), 2) 
+            input_dec = info_total
+            state_dec = zero_padding
+
+            for _ in range(self.future_len):
+                output_decoder, state_dec = self.decoder(input_dec, state_dec)
+                displacement_next = self.FC_output(output_decoder) 
+                coords_next = present + displacement_next.squeeze(0).unsqueeze(1) 
+                prediction_single = torch.cat((prediction_single, coords_next), 1) 
+                present = coords_next
+                input_dec = zero_padding
+
+            prediction = torch.cat((prediction, prediction_single.unsqueeze(1)), 1) 
+
+        return prediction, state_past
+
+    def training_step(self, batch, batch_idx):
+        past, future = batch["past"], batch["future"]
+        
+        # 1. Forward pass
+        prediction, state_past = self(past, future)
+        
+        # 2. Writing Controller Logic (Tolerance)
+        future_rep = future.unsqueeze(1).repeat(1, self.num_prediction, 1, 1)
+        distances = torch.norm(prediction - future_rep, dim=3) 
+
+        tolerance_1s = torch.sum(distances[:, :, :10] < 0.5, dim=2)
+        tolerance_2s = torch.sum(distances[:, :, 10:20] < 1.0, dim=2)
+        tolerance_3s = torch.sum(distances[:, :, 20:30] < 1.5, dim=2)
+        tolerance_4s = torch.sum(distances[:, :, 30:40] < 2.0, dim=2)
+        tolerance = tolerance_1s + tolerance_2s + tolerance_3s + tolerance_4s
+
+        tolerance_rate = torch.max(tolerance, dim=1)[0].float() / 40.0
+        tolerance_rate = tolerance_rate.unsqueeze(1) 
+
+        writing_logits = self.linear_controller(tolerance_rate)
+        writing_prob = torch.sigmoid(writing_logits)
+
+        # 3. Memory Update
+        with torch.no_grad():
+            index_writing = (writing_prob > 0.5).squeeze()
+            if index_writing.any():
+                fut_t = torch.transpose(future, 1, 2)
+                future_embed = self.relu(self.conv_fut(fut_t))
+                future_embed = torch.transpose(future_embed, 1, 2)
+                _, state_fut = self.encoder_fut(future_embed)
+
+                past_to_write = state_past.squeeze(0)[index_writing]
+                future_to_write = state_fut.squeeze(0)[index_writing]
+
+                # Update memory buffers
+                self.memory_past = torch.cat((self.memory_past, past_to_write), 0)
+                self.memory_fut = torch.cat((self.memory_fut, future_to_write), 0)
+
+        # 4. Controller Training Loss
+        # Learn to flag samples that have high prediction error (tolerance < 0.7)
+        target = (tolerance_rate < 0.7).float()
+        loss = F.binary_cross_entropy_with_logits(writing_logits, target)
+        
+        # Log to TensorBoard
+        self.log("val_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("mem/size", float(self.memory_past.shape[0]), on_epoch=True)
+        
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=self.hparams["learning_rate"])
+        return optimizer
+
+    def on_train_epoch_end(self):
+        writer = self.logger.experiment
+        for name, param in self.named_parameters():
+            writer.add_histogram(name, param, self.current_epoch)
 
 class model_controllerMem(nn.Module):
     """
