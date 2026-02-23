@@ -40,14 +40,6 @@ class ControllerLightning(pl.LightningModule):
             self.decoder = nn.GRU(dim_key * 2, dim_key * 2, 1, batch_first=False)
             self.FC_output = nn.Linear(dim_key * 2, 3)
 
-        # Layers (re-use pretrained components)
-        # self.conv_past = model_pretrained.conv_past
-        # self.conv_fut = model_pretrained.conv_fut
-        # self.encoder_past = model_pretrained.encoder_past
-        # self.encoder_fut = model_pretrained.encoder_fut
-        # self.decoder = model_pretrained.decoder
-        # self.FC_output = model_pretrained.FC_output
-
         # Freeze AE layers
         for part in [self.conv_past, self.conv_fut, 
                      self.encoder_past, self.encoder_fut, 

@@ -8,12 +8,12 @@ def parse_config():
     parser.add_argument("--learning_rate", type=int, default=0.0001)
     parser.add_argument("--max_epochs", type=int, default=600)
 
-    parser.add_argument("--past_len", type=int, default=20)
-    parser.add_argument("--future_len", type=int, default=40)
+    parser.add_argument("--past_len", type=int, default=21)
+    parser.add_argument("--future_len", type=int, default=20)
     parser.add_argument("--preds", type=int, default=5)
     parser.add_argument("--dim_embedding_key", type=int, default=48)
 
-    parser.add_argument("--model_ae", default='autoencoder_20steps_checkpoint/best-ae-epoch=27-val_eucl_mean=0.2515.ckpt')
+    parser.add_argument("--model_ae", default='autoencoder_20steps_checkpoint/best-ae-epoch=29-val_eucl_mean=0.0814.ckpt')
     parser.add_argument("--dataset_file", default="kitti_dataset.json", help="dataset file")
     parser.add_argument("--info", type=str, default='', help='Name of training. '
                                                              'It will use in tensorboard log and test folder')

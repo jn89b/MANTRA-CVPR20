@@ -1,209 +1,220 @@
 import os
 import argparse
+import datetime
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-# Need mpl_toolkits for 3D plotting projection to work correctly
-from mpl_toolkits.mplot3d import Axes3D 
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
-# Project Imports
+# Project Imports (Ensure these match your file structure)
 from dataset_evasion import MantraJsonDataset3D, mantra_collate_3d
 from models.model_memory_IRM import IRMLightning
 from models.model_controllerMem import ControllerLightning
 
 # ============================
-# Metrics Class (No changes needed here)
+# 3D Metrics & Uncertainty Class
 # ============================
 class MantraMetrics3D:
-    def __init__(self, future_len=40):
+    def __init__(self, future_len=20):
         self.future_len = future_len
-        self.ade_per_step = [] 
-        self.all_sample_ades = [] 
+        self.ade_per_step = [] # List of (B, Tf) arrays
+        self.all_sample_ades = [] # Mean ADE per sample
 
     def update(self, prediction, ground_truth):
-        # Compute 3D Euclidean distances for all K modalities
+        """
+        Calculates Winner-Takes-All 3D Euclidean distances.
+        prediction: (B, K, Tf, 3)
+        ground_truth: (B, Tf, 3)
+        """
+        # 1. 3D Euclidean Distance (X, Y, Z)
         future_rep = ground_truth.unsqueeze(1).repeat(1, prediction.shape[1], 1, 1)
         distances = torch.norm(prediction - future_rep, dim=3) # (B, K, Tf)
 
-        # Winner-Takes-All: Select best modality based on mean error
-        mean_distances = torch.mean(distances, dim=2) 
-        best_mod_idx = torch.argmin(mean_distances, dim=1)
+        # 2. Winner-Takes-All: Select best modality based on full trajectory mean
+        mean_distances = torch.mean(distances, dim=2) # (B, K)
+        best_mod_idx = torch.argmin(mean_distances, dim=1) # (B,)
 
-        # Extract errors for the winner only
-        best_errors = distances[torch.arange(len(best_mod_idx)), best_mod_idx] 
+        # 3. Extract errors for the winner only
+        best_errors = distances[torch.arange(len(best_mod_idx)), best_mod_idx] # (B, Tf)
         
         self.ade_per_step.append(best_errors.cpu().numpy())
         self.all_sample_ades.extend(torch.mean(best_errors, dim=1).cpu().numpy())
 
-    def report(self, out_dir):
-        all_errors = np.concatenate(self.ade_per_step, axis=0)
-        print(f"\n{'='*40}\n3D ADE PERFORMANCE BY HORIZON\n{'='*40}")
+        return best_errors 
         
-        # Assuming 10Hz data
-        horizons = {"1.0s": 10, "2.0s": 20, "3.0s": 30, "4.0s": 40}
+    def report(self, out_dir):
+        # (Total_Samples, Tf)
+        all_errors = np.concatenate(self.ade_per_step, axis=0) 
+        
+        print(f"\n{'='*40}\n3D ADE PERFORMANCE\n{'='*40}")
+        
+        # 1. Calculate Global Mean ADE (avoids "mean of means" bias)
+        total_mean_ade = np.mean(all_errors) 
+        
+        # 2. Horizons
+        horizons = {"1.0s": 10, "2.0s": 20}
         for label, step in horizons.items():
             if all_errors.shape[1] >= step:
+                # Mean error up to that timestep across all samples
                 ade = np.mean(all_errors[:, :step])
-                print(f"minADE @ {label}: {ade:.4f} meters")
+                print(f"minADE @ {label}: {ade:.4f} m")
         
-        mean_ade = np.mean(self.all_sample_ades)
-        print(f"Total Mean minADE: {mean_ade:.4f} meters")
-        print(f"minFDE (Final): {np.mean(all_errors[:, -1]):.4f} meters")
-        print('='*40)
+        print(f"Total Mean minADE: {total_mean_ade:.4f} m")
+        # FDE is just the error at the final index
+        print(f"minFDE (Final): {np.mean(all_errors[:, -1]):.4f} m")
+        self._plot_error_growth(all_errors, out_dir)
+        self.pickle_metrics(out_dir)
+        
+    def pickle_metrics(self, out_dir:str):
+        all_errors = np.concatenate(self.ade_per_step, axis=0)
+        mean_errors = np.mean(all_errors, axis=0)
+        std_errors = np.std(all_errors, axis=0)
+        metrics = {
+            "mean_errors": mean_errors.tolist(),
+            "std_errors": std_errors.tolist(),
+            "all_sample_ades": self.all_sample_ades,
+            "future_len": self.future_len
+        }
+        """Saves ADEs to a pickle file for later analysis."""
+        import pickle
+        with open(os.path.join(out_dir, "metrics.pkl"), "wb") as f:
+            pickle.dump(metrics, f)
+        print(f"Saved metrics to {os.path.join(out_dir, 'metrics.pkl')}")
 
-        self.plot_histogram(mean_ade, out_dir)
-
-    def plot_histogram(self, mean_ade, out_dir):
+    def _plot_histogram(self, mean_ade, out_dir):
+        """Generates ADE distribution histogram."""
         plt.figure(figsize=(10, 6))
         plt.hist(self.all_sample_ades, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
         plt.axvline(mean_ade, color='red', linestyle='dashed', linewidth=2, label=f'Mean: {mean_ade:.3f}m')
         plt.title("minADE Distribution Across Dataset (3D)")
         plt.xlabel("Average Displacement Error (meters)")
         plt.ylabel("Frequency (Samples)")
-        plt.legend()
-        plt.grid(axis='y', alpha=0.3)
+        plt.legend(); plt.grid(axis='y', alpha=0.3)
         plt.savefig(os.path.join(out_dir, "ade_distribution_histogram.png"))
-        print(f"Histogram saved to {out_dir}/ade_distribution_histogram.png")
         plt.close()
 
+    def _plot_error_growth(self, all_errors, out_dir):
+        """Generates Mean Error and Std Dev growth plot."""
+        mean_error = np.mean(all_errors, axis=0)
+        std_error = np.std(all_errors, axis=0)
+        timesteps = np.arange(1, self.future_len + 1)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(timesteps, mean_error, 'b-o', label='Mean ADE', linewidth=2)
+        plt.fill_between(timesteps, mean_error - std_error, mean_error + std_error, 
+                         color='blue', alpha=0.2, label='Uncertainty ($\sigma$)')
+        plt.title("Prediction Error & Uncertainty Over Forecast Horizon")
+        plt.xlabel("Forecast Timestep (0.05s intervals)")
+        plt.ylabel("Displacement Error (meters)")
+        plt.grid(True, linestyle='--', alpha=0.5); plt.legend()
+        plt.savefig(os.path.join(out_dir, "error_growth_over_time.png"))
+        print("saving plot")
+        #plt.show()
+        #plt.close()
+
 # ============================
-# 3D Plotting Utility
+# Plotting Utilities
 # ============================
 def plot_3d_sample(past, future, pred, save_path):
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
-    
     p, f, pr = past.cpu().numpy(), future.cpu().numpy(), pred.cpu().numpy()
     
     ax.plot(p[:, 0], p[:, 1], p[:, 2], 'b-', label='Past', linewidth=2)
-    ax.plot(f[:, 0], f[:, 1], f[:, 2], 'g-', label='Ground Truth', linewidth=2)
+    ax.plot(f[:, 0], f[:, 1], f[:, f.shape[1]-1 if len(f.shape)>=1 else 0], 'g-', label='GT', linewidth=2) # Basic GT plot
 
     colors = plt.cm.Reds(np.linspace(1, 0.4, pr.shape[0]))
     for k in range(pr.shape[0]):
-        ax.plot(pr[k, :, 0], pr[k, :, 1], pr[k, :, 2], 
-                color=colors[k], alpha=0.5, linestyle='--')
+        ax.plot(pr[k, :, 0], pr[k, :, 1], pr[k, :, 2], color=colors[k], alpha=0.5, linestyle='--')
+    ax.set_title("UAS 3D Trajectory (MANTRA)"); ax.set_zlabel("Altitude (m)")
+    plt.legend(); plt.savefig(save_path); plt.close()
 
-    ax.set_title("UAS 3D Trajectory Refinement (MANTRA)")
-    ax.set_zlabel("Altitude (m)")
-    # Set consistent view angle if desired
-    # ax.view_init(elev=20., azim=-35)
-    plt.legend()
-    plt.savefig(save_path)
-    plt.close()
-
-# ============================
-# NEW: 2D Plotting Utility
-# ============================
 def plot_2d_sample(past, future, pred, save_path):
-    """Plots top-down view (X-Y plane) ignoring Z."""
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111)
-    
-    # Select only X and Y dimensions (indices 0 and 1)
-    p = past.cpu().numpy()[:, :2]
-    f = future.cpu().numpy()[:, :2]
-    pr = pred.cpu().numpy()[:, :, :2]
-    
-    # Plot Past (Blue) and Future (Green) with markers for clarity
-    ax.plot(p[:, 0], p[:, 1], 'b-o', label='Past', linewidth=2, markersize=3, alpha=0.7)
-    ax.plot(f[:, 0], f[:, 1], 'g-x', label='Ground Truth', linewidth=2, markersize=4)
-
-    # Plot Predictions (Red Gradient)
+    plt.figure(figsize=(10, 8))
+    p, f, pr = past.cpu().numpy()[:, :2], future.cpu().numpy()[:, :2], pred.cpu().numpy()[:, :, :2]
+    plt.plot(p[:, 0], p[:, 1], 'b-o', label='Past', markersize=3)
+    plt.plot(f[:, 0], f[:, 1], 'g-x', label='GT', markersize=4)
     colors = plt.cm.Reds(np.linspace(1, 0.4, pr.shape[0]))
     for k in range(pr.shape[0]):
-        ax.plot(pr[k, :, 0], pr[k, :, 1], 
-                color=colors[k], alpha=0.6, linestyle='--', linewidth=1.5)
-
-    ax.set_title("UAS 2D Trajectory (Top-Down X-Y View)")
-    ax.set_xlabel("X Position (m)")
-    ax.set_ylabel("Y Position (m)")
-    ax.grid(True, which='both', linestyle='--', alpha=0.5)
-    # Crucial for 2D spatial plots to prevent distortion
-    ax.axis('equal') 
-    plt.legend()
-    plt.savefig(save_path)
-    plt.close()
+        plt.plot(pr[k, :, 0], pr[k, :, 1], color=colors[k], alpha=0.6, linestyle='--')
+    plt.title("Top-Down X-Y View"); plt.grid(True)
+    plt.legend(); plt.savefig(save_path); plt.close()
 
 # ============================
-# Main Execution
+# Main Inference Logic
 # ============================
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 1. Dataset Setup
-    dataset = MantraJsonDataset3D(
-        data_path=args.test_data,
-        past_len=args.past_len,
-        future_len=args.future_len,
-        return_dummy_scene=True
-    )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, 
-                            shuffle=False, collate_fn=mantra_collate_3d)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    # 2. Model Loading
-    settings = {
-        "dim_embedding_key": args.dim_embedding_key,
-        "num_prediction": args.preds,
-        "past_len": args.past_len,
-        "future_len": args.future_len,
-        "learning_rate": 0.0001
-    }
-    
-    print(f"Loading trained IRM from: {args.checkpoint}")
-    # Correct loading parameters to avoid errors
-    model = IRMLightning.load_from_checkpoint(
-        args.checkpoint, 
-        settings=settings,
-        model_pretrained=None, 
-        strict=False 
-    ).to(device).eval()
+    # 1. Dataset Initialization
+    dataset = MantraJsonDataset3D(data_path=args.test_data, past_len=args.past_len, 
+                                  future_len=args.future_len, return_dummy_scene=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=mantra_collate_3d)
 
-    print(f"Verified Memory Bank Size: {model.memory_past.shape[0]} entries")
+    # 2. Model Loading (Fixing Positional Argument & Size Mismatch Errors)
+    settings = {"dim_embedding_key": args.dim_embedding_key, "num_prediction": args.preds, 
+                "past_len": args.past_len, "future_len": args.future_len, "learning_rate": 0.0001}
+    
+    print(f"Loading IRM Checkpoint: {args.checkpoint}")
+    # Note: model_pretrained=None handles the positional arg error; strict=False handles buffer sizes
+    model = IRMLightning.load_from_checkpoint(args.checkpoint, settings=settings, 
+                                              model_pretrained=None, strict=False).to(device).eval()
+
+    print(f"Memory Bank Verified: {model.memory_past.shape[0]} segments restored")
 
     metrics = MantraMetrics3D(future_len=args.future_len)
-    os.makedirs(args.out_dir, exist_ok=True)
 
     # 3. Inference Loop
     with torch.no_grad():
         for i, batch in enumerate(tqdm(dataloader, desc="Running Inference")):
-            past = batch["past"].to(device)
-            future = batch["future"].to(device)
-            scene = batch.get("scene_one_hot").to(device) if "scene_one_hot" in batch else None
-
-            # Prediction: (B, K, Tf, 3)
-            pred = model(past, scene)
-
-            metrics.update(pred, future)
-
-            # Generate both plots for the desired number of samples
+        
+            past, future = batch["past"].to(device), batch["future"].to(device)
+            # scene = batch.get("scene_one_hot").to(device) if "scene_one_hot" in batch else None
+            # Generate multi-modal refined predictions
+            import time 
+            start_time = time.time()
+            pred = model(past) 
+            # print("end time", time.time()-start_time)
+            errors = metrics.update(pred, future)
+            
+            if i == 47:
+                print("pred", pred)
+                print("future", future)
+                print("best errors", errors)
             if i < args.num_plots:
-                # 3D Plot
-                plot_3d_sample(past[0], future[0], pred[0], 
-                               os.path.join(args.out_dir, f"sample_{i}_3d.png"))
-                # 2D Plot
-                plot_2d_sample(past[0], future[0], pred[0], 
-                               os.path.join(args.out_dir, f"sample_{i}_2d.png"))
+                plot_3d_sample(past[0], future[0], pred[0], os.path.join(args.out_dir, f"sample_{i}_3d.png"))
+                plot_2d_sample(past[0], future[0], pred[0], os.path.join(args.out_dir, f"sample_{i}_2d.png"))
 
-    # 4. Final Report & Histogram
+    # 4. Reporting & Final Plots
     metrics.report(args.out_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # Update default paths as needed
     parser.add_argument("--checkpoint", type=str, 
-        default="/root/coding_projects/MANTRA-CVPR20/training/training_IRM/2026-02-20 02-15-41_/checkpoints/model_IRM-epoch=15-val_eucl_mean=0.2304.ckpt", 
+        default="training/training_IRM/2026-02-22 23-00-00_/checkpoints/model_IRM-epoch=00-val_eucl_mean=0.4007.ckpt", 
         help="IRM checkpoint file")
-    parser.add_argument("--test_data", type=str, default="data/test", help="Test data directory")
+    test_data = ["data/blue_0_mantra_data","data/red_0_mantra_data", "data/red_1_mantra_data"]
+    test = test_data[0]
+    parser.add_argument("--test_data", type=str, default=test, help="Test data directory")
     parser.add_argument("--out_dir", type=str, default="evaluation_results_full/", help="Output for plots/histograms")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_plots", type=int, default=10, help="Number of sample pairs (2D & 3D) to save")
+    parser.add_argument("--num_plots", type=int, default=100, help="Number of sample pairs (2D & 3D) to save")
     
-    parser.add_argument("--past_len", type=int, default=20)
+    parser.add_argument("--past_len", type=int, default=21)
     parser.add_argument("--future_len", type=int, default=20)
     parser.add_argument("--preds", type=int, default=5)
     parser.add_argument("--dim_embedding_key", type=int, default=48)
-    
+    # main(parser.parse_args())
     args = parser.parse_args()
-    main(args)
+
+    for data in test_data:
+        args.test_data = data
+        args.out_dir = (
+            f"evaluation_results_full/"
+            f"{data.split('/')[-1]}_"
+            f"{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        )
+
+        main(args)
