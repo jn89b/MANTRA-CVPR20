@@ -12,15 +12,7 @@ from torch.utils.data import Dataset
 class MantraJsonDataset3D(Dataset):
     """
     Trajectory-only MANTRA dataset that reads your JSON format (list of dicts).
-    Produces:
-      past:   (Tp, 3)  [x_ego, y_ego, z_rel]
-      future: (Tf, 3)
-
-    - If use_ego_frame=True:
-        translate so last past position is origin,
-        rotate XY by -psi0 (yaw at last past step),
-        z is translated only (no rotation).
-    - No raster scene. Optionally returns dummy scene tensors for compatibility.
+    Includes noise injection logic synced with lazy_base_dataset tiers.
     """
 
     def __init__(
@@ -55,6 +47,10 @@ class MantraJsonDataset3D(Dataset):
         self.dummy_scene_hw = int(dummy_scene_hw)
         self.dummy_scene_ch = int(dummy_scene_ch)
 
+        # Noise configuration (set this manually after instantiation)
+        #self.noise_tier: Optional[str] = None # 'easy', 'medium', 'hard'
+        self.noise_tier: str = 'hard'
+
         self.json_files: List[str] = glob.glob(
             os.path.join(self.data_path, "**", "*.json"),
             recursive=True,
@@ -65,7 +61,6 @@ class MantraJsonDataset3D(Dataset):
         if len(self.json_files) == 0:
             raise RuntimeError(f"No .json files found under: {self.data_path}")
 
-        # index_map holds (file_idx, end_idx_exclusive) for each segment
         self.index_map: List[Tuple[int, int]] = []
         self._build_index_map()
 
@@ -75,14 +70,44 @@ class MantraJsonDataset3D(Dataset):
         for file_idx, fp in enumerate(self.json_files):
             with open(fp, "r") as f:
                 data = json.load(f)
-
             T = len(data)
             if T < self.total_len:
                 continue
-
-            # window is data[end_idx-total_len : end_idx]
             for end_idx in range(self.total_len, T + 1, self.step_size):
                 self.index_map.append((file_idx, end_idx))
+
+    def _apply_robust_noise(self, traj: np.ndarray) -> np.ndarray:
+        """Applies corruption logic based on lazy_base_dataset tiers."""
+        if self.noise_tier is None:
+            return traj
+
+        tier = self.noise_tier.lower()
+        T, D = traj.shape
+        out = traj.copy()
+
+        # 1. Tier Parameters (Synced with lazy_base_dataset.py)
+        if tier == "easy":
+            meas_std, rw_step, spike_p, spike_std = 0.30, 0.02, 0.002, 2.0
+        elif tier == "medium":
+            meas_std, rw_step, spike_p, spike_std = 1.0, 0.08, 0.01, 8.0
+        elif tier == "hard":
+            meas_std, rw_step, spike_p, spike_std = 2.5, 0.20, 0.03, 20.0
+        else:
+            return traj
+
+        # 2. Gaussian Measurement Noise
+        out += np.random.normal(0.0, meas_std, size=out.shape).astype(np.float32)
+
+        # 3. Random Walk (Drift)
+        steps = np.random.normal(0.0, rw_step, size=out.shape).astype(np.float32)
+        out += np.cumsum(steps, axis=0)
+
+        # 4. Outlier Spikes
+        spike_mask = np.random.rand(T) < spike_p
+        spikes = np.random.normal(0.0, spike_std, size=(T, D)).astype(np.float32)
+        out[spike_mask] += spikes[spike_mask]
+
+        return out
 
     def __len__(self):
         return len(self.index_map)
@@ -98,7 +123,6 @@ class MantraJsonDataset3D(Dataset):
         past = window[: self.past_len]
         future = window[self.past_len :]
 
-        # Extract arrays (world)
         px = np.asarray([r[self.x_key] for r in past], dtype=np.float32)
         py = np.asarray([r[self.y_key] for r in past], dtype=np.float32)
         pz = np.asarray([r[self.z_key] for r in past], dtype=np.float32)
@@ -108,35 +132,29 @@ class MantraJsonDataset3D(Dataset):
         fz = np.asarray([r[self.z_key] for r in future], dtype=np.float32)
 
         if self.use_ego_frame:
-            # translate to origin at last past step
             x0, y0, z0 = px[-1], py[-1], pz[-1]
-            px = px - x0
-            py = py - y0
-            pz = pz - z0
+            px, py, pz = px - x0, py - y0, pz - z0
+            fx, fy, fz = fx - x0, fy - y0, fz - z0
 
-            fx = fx - x0
-            fy = fy - y0
-            fz = fz - z0
-
-            # rotate XY by -yaw0
             yaw0 = float(past[-1].get(self.yaw_key, 0.0))
             c = np.cos(-yaw0).astype(np.float32)
             s = np.sin(-yaw0).astype(np.float32)
 
-            px_r = c * px - s * py
-            py_r = s * px + c * py
-            fx_r = c * fx - s * fy
-            fy_r = s * fx + c * fy
-
+            px_r, py_r = c * px - s * py, s * px + c * py
+            fx_r, fy_r = c * fx - s * fy, s * fx + c * fy
             px, py, fx, fy = px_r, py_r, fx_r, fy_r
 
-        past_traj = np.stack([px, py, pz], axis=-1)  # (Tp,3)
-        fut_traj = np.stack([fx, fy, fz], axis=-1)   # (Tf,3)
+        past_traj = np.stack([px, py, pz], axis=-1)
+        
+        # --- NOISE INJECTION ---
+        past_traj = self._apply_robust_noise(past_traj)
+        
+        fut_traj = np.stack([fx, fy, fz], axis=-1)
 
         sample: Dict[str, Any] = {
             "index": idx,
-            "past": torch.from_numpy(past_traj),      # (Tp,3)
-            "future": torch.from_numpy(fut_traj),     # (Tf,3)
+            "past": torch.from_numpy(past_traj), 
+            "future": torch.from_numpy(fut_traj), 
             "angle": torch.tensor([float(past[-1].get(self.yaw_key, 0.0))], dtype=torch.float32),
         }
 

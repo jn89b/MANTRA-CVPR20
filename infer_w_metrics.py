@@ -53,7 +53,7 @@ class MantraMetrics3D:
         total_mean_ade = np.mean(all_errors) 
         
         # 2. Horizons
-        horizons = {"1.0s": 10, "2.0s": 20}
+        horizons = {"1.0s": 20, "2.0s": 40, "3.0s": 60}
         for label, step in horizons.items():
             if all_errors.shape[1] >= step:
                 # Mean error up to that timestep across all samples
@@ -94,16 +94,19 @@ class MantraMetrics3D:
         plt.savefig(os.path.join(out_dir, "ade_distribution_histogram.png"))
         plt.close()
 
-    def _plot_error_growth(self, all_errors, out_dir):
+    def _plot_error_growth(self, all_errors:np.array, out_dir:str,
+                           dt:float = 0.05):
         """Generates Mean Error and Std Dev growth plot."""
-        mean_error = np.mean(all_errors, axis=0)
-        std_error = np.std(all_errors, axis=0)
-        timesteps = np.arange(1, self.future_len + 1)
-
+        mean_error:np.array = np.mean(all_errors, axis=0)
+        std_error:np.array = np.std(all_errors, axis=0)
+        dt = 0.05
+        seconds:np.array = np.arange(1, self.future_len + 1) * dt
+        
         plt.figure(figsize=(10, 6))
-        plt.plot(timesteps, mean_error, 'b-o', label='Mean ADE', linewidth=2)
-        plt.fill_between(timesteps, mean_error - std_error, mean_error + std_error, 
+        plt.plot(seconds, mean_error, 'b-o', label='Mean ADE', linewidth=2)
+        plt.fill_between(seconds, mean_error - std_error, mean_error + std_error, 
                          color='blue', alpha=0.2, label='Uncertainty ($\sigma$)')
+                            
         plt.title("Prediction Error & Uncertainty Over Forecast Horizon")
         plt.xlabel("Forecast Timestep (0.05s intervals)")
         plt.ylabel("Displacement Error (meters)")
@@ -193,7 +196,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, 
-        default="training/training_IRM/2026-02-22 23-00-00_/checkpoints/model_IRM-epoch=00-val_eucl_mean=0.4007.ckpt", 
+        default="training/training_IRM/2026-02-24 00-05-16_/checkpoints/model_IRM-epoch=00-val_eucl_mean=9.7650.ckpt", 
         help="IRM checkpoint file")
     test_data = ["data/blue_0_mantra_data","data/red_0_mantra_data", "data/red_1_mantra_data"]
     test = test_data[0]
@@ -202,8 +205,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_plots", type=int, default=100, help="Number of sample pairs (2D & 3D) to save")
     
-    parser.add_argument("--past_len", type=int, default=21)
-    parser.add_argument("--future_len", type=int, default=20)
+    parser.add_argument("--past_len", type=int, default=40)
+    parser.add_argument("--future_len", type=int, default=60)
     parser.add_argument("--preds", type=int, default=5)
     parser.add_argument("--dim_embedding_key", type=int, default=48)
     # main(parser.parse_args())

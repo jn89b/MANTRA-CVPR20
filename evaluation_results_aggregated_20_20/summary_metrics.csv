@@ -1,0 +1,11 @@
+metric,value
+Overall Mean ADE (m),0.504475
+Overall Mean FDE (m),1.226150
+Overall Std ADE (m),0.538670
+Overall Std FDE (m),1.298448
+Number of Test Sets,4.000000
+Total Samples,20640.000000
+Future Prediction Length (steps),20.000000
+Prediction Horizon (seconds),1.000000
+Mean ADE @ 1.0s (m),0.227963
+Mean ADE @ 2.0s (m),0.504475

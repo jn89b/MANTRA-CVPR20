@@ -8,13 +8,13 @@ def parse_config():
     parser.add_argument("--learning_rate", type=int, default=0.0001)
     parser.add_argument("--max_epochs", type=int, default=600)
 
-    parser.add_argument("--past_len", type=int, default=21)
-    parser.add_argument("--future_len", type=int, default=20)
+    parser.add_argument("--past_len", type=int, default=40)
+    parser.add_argument("--future_len", type=int, default=60)
     parser.add_argument("--preds", type=int, default=5)
     parser.add_argument("--dim_embedding_key", type=int, default=48)
 
     # MODEL CONTROLLER
-    parser.add_argument("--model", default='training/training_controller/2026-02-22 20-57-01_/checkpoints/model_controller-epoch=14-val_loss=15.9900.ckpt')
+    parser.add_argument("--model", default='training/training_controller/2026-02-23 21-16-16_/checkpoints/model_controller-epoch=02-val_loss=13.7093.ckpt')
 
     parser.add_argument("--saved_memory", default=True)
     parser.add_argument("--saveImages", default=True, help="plot qualitative examples in tensorboard")
